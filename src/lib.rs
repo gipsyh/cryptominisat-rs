@@ -7,8 +7,16 @@
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 extern crate libc;
+extern crate satif;
+
 use libc::size_t;
-use std::slice;
+use satif::{Satif, SatifSat, SatifUnsat};
+use std::{
+    collections::HashSet,
+    mem::{forget, transmute},
+    slice,
+    sync::Mutex,
+};
 
 /// The maximum number of variables allowed by the solver
 pub const MAX_NUM_VARS: size_t = (1 << 28) - 1;
@@ -54,7 +62,11 @@ pub enum Lbool {
 }
 impl Lbool {
     pub fn from(b: bool) -> Lbool {
-        if b { Lbool::True } else { Lbool::False }
+        if b {
+            Lbool::True
+        } else {
+            Lbool::False
+        }
     }
 }
 
@@ -70,27 +82,30 @@ extern "C" {
     fn cmsat_free(this: *mut SATSolver);
     fn cmsat_nvars(this: *const SATSolver) -> u32;
     fn cmsat_add_clause(this: *mut SATSolver, lits: *const Lit, num_lits: size_t) -> bool;
-    fn cmsat_add_xor_clause(this: *mut SATSolver,
-                            vars: *const u32,
-                            num_vars: size_t,
-                            rhs: bool)
-                            -> bool;
+    // fn cmsat_add_xor_clause(
+    //     this: *mut SATSolver,
+    //     vars: *const u32,
+    //     num_vars: size_t,
+    //     rhs: bool,
+    // ) -> bool;
     fn cmsat_new_vars(this: *mut SATSolver, n: size_t);
-    fn cmsat_solve(this: *mut SATSolver) -> Lbool;
-    fn cmsat_solve_with_assumptions(this: *mut SATSolver,
-                                    assumptions: *const Lit,
-                                    num_assumptions: size_t)
-                                    -> Lbool;
-    fn cmsat_simplify(this: *mut SATSolver,
-                                    assumptions: *const Lit,
-                                    num_assumptions: size_t)
-                                    -> Lbool;
+    // fn cmsat_solve(this: *mut SATSolver) -> Lbool;
+    fn cmsat_solve_with_assumptions(
+        this: *mut SATSolver,
+        assumptions: *const Lit,
+        num_assumptions: size_t,
+    ) -> Lbool;
+    fn cmsat_simplify(
+        this: *mut SATSolver,
+        assumptions: *const Lit,
+        num_assumptions: size_t,
+    ) -> Lbool;
     fn cmsat_get_model(this: *const SATSolver) -> slice_from_c<Lbool>;
     fn cmsat_get_conflict(this: *const SATSolver) -> slice_from_c<Lit>;
-    fn cmsat_set_verbosity(this: *mut SATSolver, n: u32);
-    fn cmsat_set_num_threads(this: *mut SATSolver, n: u32);
-    fn cmsat_set_default_polarity(this: *mut SATSolver, polar: bool);
-    fn cmsat_set_polarity_auto(this: *mut SATSolver);
+    // fn cmsat_set_verbosity(this: *mut SATSolver, n: u32);
+    // fn cmsat_set_num_threads(this: *mut SATSolver, n: u32);
+    // fn cmsat_set_default_polarity(this: *mut SATSolver, polar: bool);
+    // fn cmsat_set_polarity_auto(this: *mut SATSolver);
     fn cmsat_set_no_simplify(this: *mut SATSolver);
     fn cmsat_set_no_simplify_at_startup(this: *mut SATSolver);
     fn cmsat_set_no_equivalent_lit_replacement(this: *mut SATSolver);
@@ -99,44 +114,95 @@ extern "C" {
     fn cmsat_set_up_for_scalmc(this: *mut SATSolver);
     fn cmsat_set_yes_comphandler(this: *mut SATSolver);
     fn cmsat_print_stats(this: *mut SATSolver);
-    fn cmsat_set_max_time(this: *mut SATSolver, max_time: f64);
+    // fn cmsat_set_max_time(this: *mut SATSolver, max_time: f64);
+}
+
+pub struct Sat(*mut SATSolver);
+
+impl SatifSat for Sat {
+    fn lit_value(&self, lit: logic_form::Lit) -> Option<bool> {
+        let solver = Solver(self.0);
+        let res = match solver.get_model()[Into::<usize>::into(lit.var())] {
+            Lbool::True => Some(true),
+            Lbool::False => Some(false),
+            Lbool::Undef => None,
+        };
+        forget(solver);
+        res
+    }
+}
+
+pub struct Unsat {
+    core: Mutex<Option<HashSet<logic_form::Lit>>>,
+    solver: *mut SATSolver,
+}
+
+impl SatifUnsat for Unsat {
+    fn has(&self, lit: logic_form::Lit) -> bool {
+        let mut core = self.core.lock().unwrap();
+        if core.is_none() {
+            let mut set = HashSet::new();
+            let solver = Solver(self.solver);
+            let conflict = solver.get_conflict();
+            for l in conflict {
+                let l: logic_form::Lit = unsafe { transmute(*l) };
+                set.insert(!l);
+            }
+            forget(solver);
+            *core = Some(set);
+        }
+        core.as_ref().unwrap().contains(&lit)
+    }
 }
 
 pub struct Solver(*mut SATSolver);
+
+impl Satif for Solver {
+    type Sat = Sat;
+    type Unsat = Unsat;
+
+    fn new() -> Self {
+        Solver(unsafe { cmsat_new() })
+    }
+
+    fn new_var(&mut self) -> logic_form::Var {
+        let n = self.num_var();
+        self.new_vars(1);
+        logic_form::Var::new(n)
+    }
+
+    fn num_var(&self) -> usize {
+        unsafe { cmsat_nvars(self.0) as usize }
+    }
+
+    fn add_clause(&mut self, clause: &[logic_form::Lit]) {
+        let res = unsafe { cmsat_add_clause(self.0, clause.as_ptr() as *const Lit, clause.len()) };
+        assert!(res);
+    }
+
+    fn solve(&mut self, assumps: &[logic_form::Lit]) -> satif::SatResult<Self::Sat, Self::Unsat> {
+        match unsafe {
+            cmsat_solve_with_assumptions(self.0, assumps.as_ptr() as *const Lit, assumps.len())
+        } {
+            Lbool::True => satif::SatResult::Sat(Sat(self.0)),
+            Lbool::False => satif::SatResult::Unsat(Unsat {
+                core: Mutex::new(None),
+                solver: self.0,
+            }),
+            Lbool::Undef => todo!(),
+        }
+    }
+}
+
 impl Drop for Solver {
     fn drop(&mut self) {
         unsafe { cmsat_free(self.0) };
     }
 }
 impl Solver {
-    /// Create new solver instance
-    pub fn new() -> Solver {
-        Solver(unsafe { cmsat_new() })
-    }
-    /// Current number of variables. Call new_var() or new_vars() to increase this.
-    pub fn nvars(&self) -> u32 {
-        unsafe { cmsat_nvars(self.0) }
-    }
-    /// Current number of variables
-    pub fn add_clause(&mut self, lits: &[Lit]) -> bool {
-        unsafe { cmsat_add_clause(self.0, lits.as_ptr(), lits.len()) }
-    }
-    /// Add a xor clause, which enforces that the xor of the unnegated variables equals rhs.
-    /// It is generally more convienent to use add_xor_literal_clause() instead.
-    pub fn add_xor_clause(&mut self, vars: &[u32], rhs: bool) -> bool {
-        unsafe { cmsat_add_xor_clause(self.0, vars.as_ptr(), vars.len(), rhs) }
-    }
     /// Adds n new variabless.
     pub fn new_vars(&mut self, n: size_t) {
         unsafe { cmsat_new_vars(self.0, n) }
-    }
-    /// Solve and return Lbool::True if a solution was found.
-    pub fn solve(&mut self) -> Lbool {
-        unsafe { cmsat_solve(self.0) }
-    }
-    /// Solve under the assumption that the passed literals are true and return Lbool::True if a solution was found.
-    pub fn solve_with_assumptions(&mut self, assumptions: &[Lit]) -> Lbool {
-        unsafe { cmsat_solve_with_assumptions(self.0, assumptions.as_ptr(), assumptions.len()) }
     }
     /// Returns true/false/unknown status for each variable.
     pub fn get_model(&self) -> &[Lbool] {
@@ -146,48 +212,6 @@ impl Solver {
     pub fn get_conflict(&self) -> &[Lit] {
         unsafe { to_slice(cmsat_get_conflict(self.0)) }
     }
-    /// Set number of threads used for solving. Must not be called after other methods.
-    pub fn set_num_threads(&mut self, n: u32) {
-        unsafe { cmsat_set_num_threads(self.0, n) }
-    }
-
-    /// Set verbosity
-    pub fn set_verbosity(&mut self, n: u32) {
-        unsafe { cmsat_set_verbosity(self.0, n) }
-    }
-
-    /// Helper that adds a variable and returns the corresponding literal.
-    pub fn new_var(&mut self) -> Lit {
-        let n = self.nvars();
-        self.new_vars(1);
-        Lit::new(n as u32, false).unwrap()
-    }
-    /// Wrapper which calls get_model() and returns whether the given literal is true.
-    pub fn is_true(&self, lit: Lit) -> bool {
-        self.get_model()[lit.var() as usize] == Lbool::from(!lit.isneg())
-    }
-    /// Wrapper which converts literals to variables and then calls add_xor_clause()
-    pub fn add_xor_literal_clause(&mut self, lits: &[Lit], mut rhs: bool) -> bool {
-        let mut vars = Vec::with_capacity(lits.len());
-        for lit in lits {
-            vars.push(lit.var());
-            rhs ^= lit.isneg();
-        }
-        self.add_xor_clause(&vars, rhs)
-    }
-
-     /// Set a limit on the running time
-    pub fn set_max_time(&mut self, max_time: f64) {
-        unsafe { cmsat_set_max_time(self.0, max_time) }
-    }
-
-    pub fn set_default_polarity(&mut self, polar: bool) {
-        unsafe { cmsat_set_default_polarity(self.0, polar) }
-    }
-    pub fn set_polarity_auto(&mut self) {
-        unsafe { cmsat_set_polarity_auto(self.0) }
-    }
-
     pub fn set_no_simplify(&mut self) {
         unsafe { cmsat_set_no_simplify(self.0) }
     }

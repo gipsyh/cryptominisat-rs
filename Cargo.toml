@@ -23,6 +23,8 @@ exclude = [
 
 [dependencies]
 libc = "0.2.81"
+satif = { path = "../satif" }
+logic-form = { path = "../logic-form" }
 
 [build-dependencies]
 cmake = "0.1.45"
