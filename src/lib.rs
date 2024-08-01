@@ -10,13 +10,8 @@ extern crate libc;
 extern crate satif;
 
 use libc::size_t;
-use satif::{Satif, SatifSat, SatifUnsat};
-use std::{
-    collections::HashSet,
-    mem::{forget, transmute},
-    slice,
-    sync::Mutex,
-};
+use satif::Satif;
+use std::{collections::HashSet, mem::transmute, slice, sync::Mutex};
 
 /// The maximum number of variables allowed by the solver
 pub const MAX_NUM_VARS: size_t = (1 << 28) - 1;
@@ -117,54 +112,15 @@ extern "C" {
     // fn cmsat_set_max_time(this: *mut SATSolver, max_time: f64);
 }
 
-pub struct Sat(*mut SATSolver);
+pub struct Solver(*mut SATSolver, Mutex<Option<HashSet<logic_form::Lit>>>);
 
-impl SatifSat for Sat {
-    fn lit_value(&self, lit: logic_form::Lit) -> Option<bool> {
-        let solver = Solver(self.0);
-        let res = match solver.get_model()[Into::<usize>::into(lit.var())] {
-            Lbool::True => Some(true),
-            Lbool::False => Some(false),
-            Lbool::Undef => None,
-        };
-        forget(solver);
-        res
+impl Solver {
+    fn new() -> Self {
+        Solver(unsafe { cmsat_new() }, Mutex::new(None))
     }
 }
-
-pub struct Unsat {
-    core: Mutex<Option<HashSet<logic_form::Lit>>>,
-    solver: *mut SATSolver,
-}
-
-impl SatifUnsat for Unsat {
-    fn has(&self, lit: logic_form::Lit) -> bool {
-        let mut core = self.core.lock().unwrap();
-        if core.is_none() {
-            let mut set = HashSet::new();
-            let solver = Solver(self.solver);
-            let conflict = solver.get_conflict();
-            for l in conflict {
-                let l: logic_form::Lit = unsafe { transmute(*l) };
-                set.insert(!l);
-            }
-            forget(solver);
-            *core = Some(set);
-        }
-        core.as_ref().unwrap().contains(&lit)
-    }
-}
-
-pub struct Solver(*mut SATSolver);
 
 impl Satif for Solver {
-    type Sat = Sat;
-    type Unsat = Unsat;
-
-    fn new() -> Self {
-        Solver(unsafe { cmsat_new() })
-    }
-
     fn new_var(&mut self) -> logic_form::Var {
         let n = self.num_var();
         self.new_vars(1);
@@ -180,17 +136,38 @@ impl Satif for Solver {
         assert!(res);
     }
 
-    fn solve(&mut self, assumps: &[logic_form::Lit]) -> satif::SatResult<Self::Sat, Self::Unsat> {
+    fn solve(&mut self, assumps: &[logic_form::Lit]) -> bool {
+        *self.1.lock().unwrap() = None;
         match unsafe {
             cmsat_solve_with_assumptions(self.0, assumps.as_ptr() as *const Lit, assumps.len())
         } {
-            Lbool::True => satif::SatResult::Sat(Sat(self.0)),
-            Lbool::False => satif::SatResult::Unsat(Unsat {
-                core: Mutex::new(None),
-                solver: self.0,
-            }),
+            Lbool::True => true,
+            Lbool::False => false,
             Lbool::Undef => todo!(),
         }
+    }
+
+    fn sat_value(&mut self, lit: logic_form::Lit) -> Option<bool> {
+        let res = match self.get_model()[Into::<usize>::into(lit.var())] {
+            Lbool::True => Some(true),
+            Lbool::False => Some(false),
+            Lbool::Undef => None,
+        };
+        res
+    }
+
+    fn unsat_has(&mut self, lit: logic_form::Lit) -> bool {
+        let mut core = self.1.lock().unwrap();
+        if core.is_none() {
+            let mut set = HashSet::new();
+            let conflict = self.get_conflict();
+            for l in conflict {
+                let l: logic_form::Lit = unsafe { transmute(*l) };
+                set.insert(!l);
+            }
+            *core = Some(set);
+        }
+        core.as_ref().unwrap().contains(&lit)
     }
 }
 
@@ -199,6 +176,7 @@ impl Drop for Solver {
         unsafe { cmsat_free(self.0) };
     }
 }
+
 impl Solver {
     /// Adds n new variabless.
     pub fn new_vars(&mut self, n: size_t) {
