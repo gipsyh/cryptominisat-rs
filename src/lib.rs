@@ -115,7 +115,7 @@ extern "C" {
 pub struct Solver(*mut SATSolver, Mutex<Option<HashSet<logic_form::Lit>>>);
 
 impl Solver {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Solver(unsafe { cmsat_new() }, Mutex::new(None))
     }
 }
